@@ -1655,7 +1655,9 @@ BUILTIN_BANKS = {
     },
 }
 
-BATCH_SIZE = 10
+BATCH_SIZE_OPTIONS = [10, 20, 30]
+DEFAULT_BATCH_SIZE = 10
+STUDY_MODES = ["👉 顺序刷题模式", "🔥 错题本复习模式"]
 
 OPTION_RE = re.compile(r"^([A-Z])\.\s*(.+)$")
 ANSWER_RE = re.compile(r"^答案[：:]\s*(.+)$")
@@ -1829,7 +1831,8 @@ def build_active_pool(quiz_type: str) -> list[dict]:
 # ──────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="视听运营三级题库刷题神器",
+    page_title="刷刷过",
+    page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -1842,6 +1845,8 @@ def init_session_state():
     defaults = {
         "quiz_type": "单选题",
         "batch_index": 0,
+        "batch_size": DEFAULT_BATCH_SIZE,
+        "study_mode": STUDY_MODES[0],
         "submitted": False,
         "user_answers": {},
         "results": None,
@@ -1849,6 +1854,7 @@ def init_session_state():
         "uploaded_banks": {},
         "enabled_banks": list(BUILTIN_BANKS.keys()),
         "processed_upload_hashes": set(),
+        "wrong_book": {},
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1872,10 +1878,47 @@ def clear_batch_state():
     st.session_state.form_reset += 1
 
 
+def get_wrong_questions_for_type(quiz_type: str) -> list[dict]:
+    pool = []
+    for uid, record in st.session_state.wrong_book.items():
+        if record.get("quiz_type") == quiz_type:
+            pool.append({**record, "_uid": uid})
+    pool.sort(key=lambda q: (q.get("_bank", ""), q.get("id", 0)))
+    return pool
+
+
+def get_question_pool() -> list[dict]:
+    if st.session_state.study_mode == STUDY_MODES[1]:
+        return get_wrong_questions_for_type(st.session_state.quiz_type)
+    return build_active_pool(st.session_state.quiz_type)
+
+
 def get_current_questions():
-    bank = build_active_pool(st.session_state.quiz_type)
-    start = st.session_state.batch_index * BATCH_SIZE
-    return bank[start : start + BATCH_SIZE], len(bank)
+    bank = get_question_pool()
+    batch_size = st.session_state.batch_size
+    start = st.session_state.batch_index * batch_size
+    return bank[start : start + batch_size], len(bank)
+
+
+def record_wrong_book_entry(question: dict, quiz_type: str):
+    entry = {
+        "uid": question["_uid"],
+        "quiz_type": quiz_type,
+        "id": question["id"],
+        "stem": question["stem"],
+        "answer": question["answer"],
+        "_bank": question.get("_bank", ""),
+    }
+    if "options" in question:
+        entry["options"] = question["options"]
+    st.session_state.wrong_book[question["_uid"]] = entry
+
+
+def update_wrong_book(question: dict, user_ans, is_correct: bool, quiz_type: str):
+    if is_correct:
+        st.session_state.wrong_book.pop(question["_uid"], None)
+    else:
+        record_wrong_book_entry(question, quiz_type)
 
 
 def process_uploaded_files(uploaded_files):
@@ -1936,6 +1979,31 @@ def check_answer(user_ans, correct_ans, quiz_type):
 
 with st.sidebar:
     st.title("📚 题库导航")
+
+    selected_mode = st.radio(
+        "模式选择",
+        STUDY_MODES,
+        index=STUDY_MODES.index(st.session_state.study_mode),
+        key="study_mode_radio",
+    )
+    if selected_mode != st.session_state.study_mode:
+        st.session_state.study_mode = selected_mode
+        reset_progress()
+        st.rerun()
+
+    st.markdown("---")
+
+    selected_batch_size = st.selectbox(
+        "选择每组题数",
+        BATCH_SIZE_OPTIONS,
+        index=BATCH_SIZE_OPTIONS.index(st.session_state.batch_size),
+        key="batch_size_select",
+    )
+    if selected_batch_size != st.session_state.batch_size:
+        st.session_state.batch_size = selected_batch_size
+        reset_progress()
+        st.rerun()
+
     st.markdown("---")
 
     selected_type = st.radio(
@@ -1950,69 +2018,78 @@ with st.sidebar:
         reset_progress()
         st.rerun()
 
-    st.markdown("### 📂 选择题库")
-    all_banks = get_all_banks()
-    bank_labels = {
-        key: f"{bank['name']}（{bank['type']}，{len(bank['questions'])} 题）"
-        for key, bank in all_banks.items()
-    }
-    valid_enabled = [k for k in st.session_state.enabled_banks if k in all_banks]
-    selected_banks = st.multiselect(
-        "勾选要作答的题库",
-        options=list(bank_labels.keys()),
-        default=valid_enabled,
-        format_func=lambda k: bank_labels[k],
-        key="bank_multiselect",
-    )
+    wrong_count = len(get_wrong_questions_for_type(st.session_state.quiz_type))
+    st.metric("本题型错题数", wrong_count)
 
-    if set(selected_banks) != set(st.session_state.enabled_banks):
-        st.session_state.enabled_banks = selected_banks
-        reset_progress()
-        st.rerun()
+    if st.session_state.study_mode == STUDY_MODES[0]:
+        st.markdown("### 📂 选择题库")
+        all_banks = get_all_banks()
+        bank_labels = {
+            key: f"{bank['name']}（{bank['type']}，{len(bank['questions'])} 题）"
+            for key, bank in all_banks.items()
+        }
+        valid_enabled = [k for k in st.session_state.enabled_banks if k in all_banks]
+        selected_banks = st.multiselect(
+            "勾选要作答的题库",
+            options=list(bank_labels.keys()),
+            default=valid_enabled,
+            format_func=lambda k: bank_labels[k],
+            key="bank_multiselect",
+        )
 
-    if st.session_state.uploaded_banks:
-        st.markdown("**管理上传题库**")
-        for bank_key, bank in list(st.session_state.uploaded_banks.items()):
-            col_a, col_b = st.columns([3, 1])
-            with col_a:
-                st.caption(bank_labels.get(bank_key, bank["name"]))
-            with col_b:
-                if st.button("删除", key=f"del_bank_{bank_key}"):
-                    filename = bank.get("filename", "")
-                    st.session_state.uploaded_banks.pop(bank_key, None)
-                    st.session_state.enabled_banks = [
-                        k for k in st.session_state.enabled_banks if k != bank_key
-                    ]
-                    if filename:
-                        for h in list(st.session_state.processed_upload_hashes):
-                            upload_key = f"upload_{h[:10]}"
-                            if upload_key == bank_key:
-                                st.session_state.processed_upload_hashes.discard(h)
-                    reset_progress()
-                    st.rerun()
+        if set(selected_banks) != set(st.session_state.enabled_banks):
+            st.session_state.enabled_banks = selected_banks
+            reset_progress()
+            st.rerun()
 
-    active_pool = build_active_pool(st.session_state.quiz_type)
+        if st.session_state.uploaded_banks:
+            st.markdown("**管理上传题库**")
+            for bank_key, bank in list(st.session_state.uploaded_banks.items()):
+                col_a, col_b = st.columns([3, 1])
+                with col_a:
+                    st.caption(bank_labels.get(bank_key, bank["name"]))
+                with col_b:
+                    if st.button("删除", key=f"del_bank_{bank_key}"):
+                        filename = bank.get("filename", "")
+                        st.session_state.uploaded_banks.pop(bank_key, None)
+                        st.session_state.enabled_banks = [
+                            k for k in st.session_state.enabled_banks if k != bank_key
+                        ]
+                        if filename:
+                            for h in list(st.session_state.processed_upload_hashes):
+                                upload_key = f"upload_{h[:10]}"
+                                if upload_key == bank_key:
+                                    st.session_state.processed_upload_hashes.discard(h)
+                        reset_progress()
+                        st.rerun()
+    else:
+        st.caption("错题本模式下，仅复习已收录的错题。")
+
+    active_pool = get_question_pool()
     total = len(active_pool)
+    batch_size = st.session_state.batch_size
     if total > 0:
-        current_start = st.session_state.batch_index * BATCH_SIZE + 1
-        current_end = min((st.session_state.batch_index + 1) * BATCH_SIZE, total)
+        current_start = st.session_state.batch_index * batch_size + 1
+        current_end = min((st.session_state.batch_index + 1) * batch_size, total)
     else:
         current_start = 0
         current_end = 0
 
     st.markdown("---")
-    st.metric("当前题型可用题数", total)
+    pool_label = "当前错题可用题数" if st.session_state.study_mode == STUDY_MODES[1] else "当前题型可用题数"
+    st.metric(pool_label, total)
     if total > 0:
         st.metric("当前进度", f"第 {current_start}–{current_end} 题")
         st.progress(min(current_end / total, 1.0))
-    else:
+    elif st.session_state.study_mode == STUDY_MODES[0]:
         st.warning("请至少勾选一个包含本题型题目的题库。")
 
 # ──────────────────────────────────────────────
 # 主内容区
 # ──────────────────────────────────────────────
 
-st.title("🎯 视听运营三级题库刷题神器")
+st.title("📝 刷刷过 · 视听运营冲刺神器")
+st.markdown("欢迎来到【刷刷过】！内置 1610 道核心题库，支持随时巩固与复习。")
 
 with st.expander("📤 上传自定义 Word 题库（可选）", expanded=False):
     st.caption(
@@ -2039,14 +2116,23 @@ with st.expander("📤 上传自定义 Word 题库（可选）", expanded=False)
 
 enabled_count = len(st.session_state.enabled_banks)
 uploaded_count = len(st.session_state.uploaded_banks)
+batch_size = st.session_state.batch_size
+mode_label = "错题本复习" if st.session_state.study_mode == STUDY_MODES[1] else "顺序刷题"
 st.caption(
-    f"当前题型：**{st.session_state.quiz_type}** ｜ 每批 {BATCH_SIZE} 题 ｜ "
-    f"已启用 {enabled_count} 个题库（内置 3 个 + 上传 {uploaded_count} 个）"
+    f"当前模式：**{mode_label}** ｜ 当前题型：**{st.session_state.quiz_type}** ｜ "
+    f"每批 {batch_size} 题 ｜ 已启用 {enabled_count} 个题库（内置 3 个 + 上传 {uploaded_count} 个）"
 )
+
+if st.session_state.study_mode == STUDY_MODES[1]:
+    wrong_count = len(get_wrong_questions_for_type(st.session_state.quiz_type))
+    st.metric("当前题型错题总数", wrong_count)
+    if wrong_count == 0:
+        st.success("暂无错题，继续保持！")
+        st.stop()
 
 questions, total_count = get_current_questions()
 
-if total_count == 0:
+if st.session_state.study_mode == STUDY_MODES[0] and total_count == 0:
     st.info("当前没有可作答的题目。请在左侧勾选至少一个题库，或上传新的 Word 文档。")
     st.stop()
 
@@ -2061,7 +2147,7 @@ if not questions:
 # ── 答题表单 ──
 with st.form("quiz_form", clear_on_submit=False):
     for idx, q in enumerate(questions):
-        global_num = st.session_state.batch_index * BATCH_SIZE + idx + 1
+        global_num = st.session_state.batch_index * batch_size + idx + 1
         st.markdown(f"**第 {global_num} 题**")
         st.markdown(q["stem"])
 
@@ -2098,7 +2184,10 @@ with st.form("quiz_form", clear_on_submit=False):
 
         st.markdown("---")
 
-    submitted = st.form_submit_button("✅ 提交这 10 道题对答案", use_container_width=True)
+    submitted = st.form_submit_button(
+        f"✅ 提交这 {batch_size} 道题对答案",
+        use_container_width=True,
+    )
 
 if submitted:
     user_answers = {}
@@ -2118,12 +2207,13 @@ if submitted:
 
         correct_ans = q["answer"]
         is_correct = check_answer(user_ans, correct_ans, st.session_state.quiz_type)
+        update_wrong_book(q, user_ans, is_correct, st.session_state.quiz_type)
         user_answers[q["_uid"]] = user_ans
         results.append({
             "id": q["id"],
             "uid": q["_uid"],
             "bank": q.get("_bank", ""),
-            "global_num": st.session_state.batch_index * BATCH_SIZE + idx + 1,
+            "global_num": st.session_state.batch_index * batch_size + idx + 1,
             "stem": q["stem"],
             "user_answer": user_ans,
             "correct_answer": correct_ans,
@@ -2164,14 +2254,14 @@ if st.session_state.submitted and st.session_state.results:
     )
 
     # ── 翻页 ──
-    next_start = (st.session_state.batch_index + 1) * BATCH_SIZE
+    next_start = (st.session_state.batch_index + 1) * batch_size
     has_more = next_start < total_count
 
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
         if has_more:
-            if st.button("➡️ 进入下 10 道题", use_container_width=True):
+            if st.button(f"➡️ 进入下 {batch_size} 道题", use_container_width=True):
                 st.session_state.batch_index += 1
                 clear_batch_state()
                 st.rerun()
