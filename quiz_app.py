@@ -2014,13 +2014,16 @@ def load_user_progress() -> None:
         return
 
     data = None
-    remote_content, _ = github_fetch_file(USER_PROGRESS_FILE)
-    if remote_content:
-        try:
-            data = json.loads(remote_content.decode("utf-8"))
-            get_user_progress_local_path().write_bytes(remote_content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            data = None
+    try:
+        remote_content, _ = github_fetch_file(USER_PROGRESS_FILE)
+        if remote_content:
+            try:
+                data = json.loads(remote_content.decode("utf-8"))
+                get_user_progress_local_path().write_bytes(remote_content)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = None
+    except Exception:
+        data = None
 
     if data is None:
         local_path = get_user_progress_local_path()
@@ -2142,10 +2145,6 @@ def init_session_state():
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
-
-init_session_state()
-load_persisted_uploads()
-load_user_progress()
 
 
 def reset_progress():
@@ -2344,6 +2343,11 @@ def render_submitted_option_feedback(question: dict, user_ans, quiz_type: str) -
             )
         else:
             render_option_highlight(f"{letter}. {safe_text}", "color:#666;")
+
+
+init_session_state()
+load_persisted_uploads()
+load_user_progress()
 
 
 # ──────────────────────────────────────────────
