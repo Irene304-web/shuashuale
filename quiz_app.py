@@ -3,6 +3,7 @@
 
 import base64
 import hashlib
+import html
 import io
 import re
 import zipfile
@@ -11,14 +12,16 @@ from xml.etree import ElementTree as ET
 
 import requests
 import streamlit as st
+from pypdf import PdfReader
 
 APP_DIR = Path(__file__).resolve().parent
 GITHUB_COMMIT_MESSAGE = "chore: 网页端自动同步新题库"
-BUILTIN_DOCX_NAMES = {
+BUILTIN_UPLOAD_EXCLUDES = {
     "视听运营三级（单选题）(2).docx",
     "视听运营三级（多选题）(2).docx",
     "视听运营三级（判断题）(2).docx",
 }
+SUPPORTED_UPLOAD_TYPES = ("docx", "pdf")
 
 # ──────────────────────────────────────────────
 # 题库数据（从 Word 文档自动解析嵌入）
@@ -1800,8 +1803,37 @@ def detect_quiz_type(filename: str, paras: list[str]) -> str | None:
     return best_type if best_count > 0 else None
 
 
-def parse_word_file(data: bytes, filename: str) -> tuple[str, list[dict]] | None:
-    paras = extract_paragraphs_from_bytes(data)
+def normalize_quiz_text_to_paragraphs(text: str) -> list[str]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(\d+)\.\s", r"\n\1. ", text)
+    text = re.sub(r"([A-E])\.\s", r"\n\1. ", text)
+    text = re.sub(r"答案[：:]\s*", r"\n答案：", text)
+
+    paragraphs = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^第\s*\d+\s*页", line):
+            continue
+        if re.match(r"^- \d+ -$", line):
+            continue
+        paragraphs.append(line)
+    return paragraphs
+
+
+def extract_paragraphs_from_pdf(data: bytes) -> list[str]:
+    reader = PdfReader(io.BytesIO(data))
+    page_texts = []
+    for page in reader.pages:
+        page_texts.append(page.extract_text() or "")
+    return normalize_quiz_text_to_paragraphs("\n".join(page_texts))
+
+
+def parse_quiz_paragraphs(paras: list[str], filename: str) -> tuple[str, list[dict]] | None:
+    if not paras:
+        return None
+
     quiz_type = detect_quiz_type(filename, paras)
     if not quiz_type:
         return None
@@ -1815,6 +1847,25 @@ def parse_word_file(data: bytes, filename: str) -> tuple[str, list[dict]] | None
     if not questions:
         return None
     return quiz_type, questions
+
+
+def parse_word_file(data: bytes, filename: str) -> tuple[str, list[dict]] | None:
+    paras = extract_paragraphs_from_bytes(data)
+    return parse_quiz_paragraphs(paras, filename)
+
+
+def parse_pdf_file(data: bytes, filename: str) -> tuple[str, list[dict]] | None:
+    paras = extract_paragraphs_from_pdf(data)
+    return parse_quiz_paragraphs(paras, filename)
+
+
+def parse_upload_file(data: bytes, filename: str) -> tuple[str, list[dict]] | None:
+    ext = Path(filename).suffix.lower()
+    if ext == ".docx":
+        return parse_word_file(data, filename)
+    if ext == ".pdf":
+        return parse_pdf_file(data, filename)
+    return None
 
 
 def sanitize_filename(filename: str) -> str:
@@ -1895,21 +1946,22 @@ def load_persisted_uploads():
     if st.session_state.get("persisted_loaded"):
         return
 
-    for filepath in sorted(APP_DIR.glob("*.docx")):
-        if filepath.name in BUILTIN_DOCX_NAMES:
-            continue
+    for pattern in ("*.docx", "*.pdf"):
+        for filepath in sorted(APP_DIR.glob(pattern)):
+            if filepath.name in BUILTIN_UPLOAD_EXCLUDES:
+                continue
 
-        content = filepath.read_bytes()
-        file_hash = hashlib.md5(content).hexdigest()
-        if file_hash in st.session_state.processed_upload_hashes:
-            continue
+            content = filepath.read_bytes()
+            file_hash = hashlib.md5(content).hexdigest()
+            if file_hash in st.session_state.processed_upload_hashes:
+                continue
 
-        result = parse_word_file(content, filepath.name)
-        if not result:
-            continue
+            result = parse_upload_file(content, filepath.name)
+            if not result:
+                continue
 
-        quiz_type, questions = result
-        register_uploaded_bank(filepath.name, content, quiz_type, questions)
+            quiz_type, questions = result
+            register_uploaded_bank(filepath.name, content, quiz_type, questions)
 
     st.session_state.persisted_loaded = True
 
@@ -1988,6 +2040,27 @@ def clear_batch_state():
     st.session_state.form_reset += 1
 
 
+def apply_batch_size_change(new_batch_size: int) -> bool:
+    old_batch_size = st.session_state.batch_size
+    if new_batch_size == old_batch_size:
+        return False
+
+    current_global_idx = st.session_state.batch_index * old_batch_size
+    total = len(get_question_pool())
+    if total > 0:
+        current_global_idx = min(current_global_idx, total - 1)
+        st.session_state.batch_index = current_global_idx // new_batch_size
+    else:
+        st.session_state.batch_index = 0
+
+    st.session_state.batch_size = new_batch_size
+    st.session_state.submitted = False
+    st.session_state.user_answers = {}
+    st.session_state.results = None
+    st.session_state.form_reset += 1
+    return True
+
+
 def get_wrong_questions_for_type(quiz_type: str) -> list[dict]:
     pool = []
     for uid, record in st.session_state.wrong_book.items():
@@ -2050,7 +2123,7 @@ def process_uploaded_files(uploaded_files):
 
         if local_file_exists(filename):
             skipped.append(filename)
-            result = parse_word_file(content, filename)
+            result = parse_upload_file(content, filename)
             if result:
                 quiz_type, questions = result
                 added.append(register_uploaded_bank(filename, content, quiz_type, questions))
@@ -2058,7 +2131,7 @@ def process_uploaded_files(uploaded_files):
                 errors.append(filename)
             continue
 
-        result = parse_word_file(content, filename)
+        result = parse_upload_file(content, filename)
         if not result:
             errors.append(filename)
             continue
@@ -2094,6 +2167,62 @@ def check_answer(user_ans, correct_ans, quiz_type):
     return user_ans == correct_ans
 
 
+def render_option_highlight(text: str, style: str) -> None:
+    st.markdown(
+        f'<p style="margin:0.25rem 0;{style}">{text}</p>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_submitted_option_feedback(question: dict, user_ans, quiz_type: str) -> None:
+    correct = question["answer"]
+    st.markdown("**选项批改：**")
+
+    if quiz_type == "多选题":
+        correct_set = set(correct)
+        user_set = set(user_ans or [])
+        for letter, text in sorted(question["options"].items()):
+            safe_text = html.escape(text)
+            if letter in user_set and letter not in correct_set:
+                render_option_highlight(
+                    f"❌ <b>{letter}.</b> {safe_text}",
+                    "color:#e74c3c;font-weight:600;",
+                )
+            elif letter in correct_set:
+                render_option_highlight(
+                    f"✅ <b>{letter}.</b> {safe_text}",
+                    "color:#27ae60;font-weight:700;",
+                )
+            else:
+                render_option_highlight(f"{letter}. {safe_text}", "color:#666;")
+        return
+
+    if quiz_type == "判断题":
+        for opt in ["正确", "错误"]:
+            if user_ans and user_ans != correct and user_ans == opt:
+                render_option_highlight(f"❌ <b>{opt}</b>", "color:#e74c3c;font-weight:600;")
+            elif opt == correct:
+                render_option_highlight(f"✅ <b>{opt}</b>", "color:#27ae60;font-weight:700;")
+            else:
+                render_option_highlight(opt, "color:#666;")
+        return
+
+    for letter, text in sorted(question["options"].items()):
+        safe_text = html.escape(text)
+        if user_ans and user_ans != correct and user_ans == letter:
+            render_option_highlight(
+                f"❌ <b>{letter}.</b> {safe_text}",
+                "color:#e74c3c;font-weight:600;",
+            )
+        elif letter == correct:
+            render_option_highlight(
+                f"✅ <b>{letter}.</b> {safe_text}",
+                "color:#27ae60;font-weight:700;",
+            )
+        else:
+            render_option_highlight(f"{letter}. {safe_text}", "color:#666;")
+
+
 # ──────────────────────────────────────────────
 # 侧边栏
 # ──────────────────────────────────────────────
@@ -2121,8 +2250,7 @@ with st.sidebar:
         key="batch_size_select",
     )
     if selected_batch_size != st.session_state.batch_size:
-        st.session_state.batch_size = selected_batch_size
-        reset_progress()
+        apply_batch_size_change(selected_batch_size)
         st.rerun()
 
     st.markdown("---")
@@ -2212,14 +2340,14 @@ with st.sidebar:
 st.title("📝 刷刷过 · 视听运营冲刺神器")
 st.markdown("欢迎来到【刷刷过】！内置 1610 道核心题库，支持随时巩固与复习。")
 
-with st.expander("📤 上传自定义 Word 题库（可选）", expanded=False):
+with st.expander("📤 上传自定义题库（Word / PDF，可选）", expanded=False):
     st.caption(
-        "支持 .docx 格式。不上传时默认使用内置 1610 道题；"
-        "新文件将自动同步至 GitHub 云端保险箱，并与内置题库并存。"
+        "支持 .docx / .pdf 格式，手机网页也可直接上传。"
+        "不上传时默认使用内置 1610 道题；新文件将自动同步至 GitHub 保险箱。"
     )
     uploaded_files = st.file_uploader(
-        "选择 Word 题库文件",
-        type=["docx"],
+        "选择题库文件",
+        type=list(SUPPORTED_UPLOAD_TYPES),
         accept_multiple_files=True,
         key="word_uploader",
         label_visibility="collapsed",
@@ -2227,7 +2355,7 @@ with st.expander("📤 上传自定义 Word 题库（可选）", expanded=False)
     if uploaded_files:
         added, errors, synced, skipped = process_uploaded_files(uploaded_files)
         if synced:
-            st.success("🎉 新题库已永久同步至云端保险箱！正在刷新题目...")
+            st.success("🎉 新题库已永久同步至 GitHub 保险箱！正在刷新题目...")
             st.rerun()
         if added and not synced:
             st.success("已成功解析并加入题库：\n" + "\n".join(f"- {item}" for item in added))
@@ -2271,6 +2399,7 @@ if not questions:
     st.stop()
 
 # ── 答题表单 ──
+is_locked = st.session_state.submitted
 with st.form("quiz_form", clear_on_submit=False):
     for idx, q in enumerate(questions):
         global_num = st.session_state.batch_index * batch_size + idx + 1
@@ -2282,12 +2411,13 @@ with st.form("quiz_form", clear_on_submit=False):
         if st.session_state.quiz_type == "多选题":
             st.markdown("（多选，请勾选所有正确选项）")
             cols = st.columns(len(q["options"]))
-            selected = []
             for col_idx, (letter, text) in enumerate(sorted(q["options"].items())):
                 with cols[col_idx]:
-                    if st.checkbox(f"**{letter}**. {text}", key=f"{form_key}_{letter}"):
-                        selected.append(letter)
-            # checkbox values captured via form submit below
+                    st.checkbox(
+                        f"**{letter}**. {text}",
+                        key=f"{form_key}_{letter}",
+                        disabled=is_locked,
+                    )
         elif st.session_state.quiz_type == "判断题":
             st.radio(
                 "请选择",
@@ -2295,6 +2425,7 @@ with st.form("quiz_form", clear_on_submit=False):
                 key=form_key,
                 index=None,
                 horizontal=True,
+                disabled=is_locked,
             )
         else:
             option_labels = [f"{k}. {v}" for k, v in sorted(q["options"].items())]
@@ -2306,13 +2437,19 @@ with st.form("quiz_form", clear_on_submit=False):
                 key=form_key,
                 index=None,
                 horizontal=False,
+                disabled=is_locked,
             )
+
+        if is_locked:
+            user_ans = st.session_state.user_answers.get(q["_uid"])
+            render_submitted_option_feedback(q, user_ans, st.session_state.quiz_type)
 
         st.markdown("---")
 
     submitted = st.form_submit_button(
         f"✅ 提交这 {batch_size} 道题对答案",
         use_container_width=True,
+        disabled=is_locked,
     )
 
 if submitted:
