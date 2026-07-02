@@ -5,6 +5,7 @@ import base64
 import hashlib
 import html
 import io
+import json
 import re
 import zipfile
 from pathlib import Path
@@ -16,6 +17,8 @@ from pypdf import PdfReader
 
 APP_DIR = Path(__file__).resolve().parent
 GITHUB_COMMIT_MESSAGE = "chore: 网页端自动同步新题库"
+PROGRESS_COMMIT_MESSAGE = "chore: 同步刷题进度与错题本"
+USER_PROGRESS_FILE = "user_progress.json"
 BUILTIN_UPLOAD_EXCLUDES = {
     "视听运营三级（单选题）(2).docx",
     "视听运营三级（多选题）(2).docx",
@@ -1897,32 +1900,150 @@ def get_github_config() -> dict | None:
         return None
 
 
-def upload_file_to_github(filename: str, content: bytes) -> tuple[bool, str]:
-    cfg = get_github_config()
-    if not cfg:
-        return False, "未配置 GitHub Secrets，已跳过云端同步。"
-
-    safe_name = sanitize_filename(filename)
-    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{safe_name}"
-    headers = {
+def github_api_headers(cfg: dict) -> dict:
+    return {
         "Authorization": f"Bearer {cfg['token']}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def github_fetch_file(filename: str) -> tuple[bytes | None, str | None]:
+    cfg = get_github_config()
+    if not cfg:
+        return None, None
+
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{filename}"
+    response = requests.get(
+        url,
+        headers=github_api_headers(cfg),
+        params={"ref": cfg["branch"]},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        return None, None
+
+    data = response.json()
+    content = base64.b64decode(data["content"].replace("\n", ""))
+    return content, data.get("sha")
+
+
+def github_upload_file(
+    filename: str,
+    content: bytes,
+    message: str,
+    sha: str | None = None,
+) -> tuple[bool, str, str | None]:
+    cfg = get_github_config()
+    if not cfg:
+        return False, "未配置 GitHub Secrets，已跳过云端同步。", None
+
+    safe_name = sanitize_filename(filename)
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{safe_name}"
     payload = {
-        "message": GITHUB_COMMIT_MESSAGE,
+        "message": message,
         "content": base64.b64encode(content).decode("ascii"),
         "branch": cfg["branch"],
     }
+    if sha:
+        payload["sha"] = sha
 
-    response = requests.put(url, headers=headers, json=payload, timeout=60)
+    response = requests.put(url, headers=github_api_headers(cfg), json=payload, timeout=60)
     if response.status_code in (200, 201):
-        return True, ""
+        new_sha = response.json().get("content", {}).get("sha")
+        return True, "", new_sha
 
-    if response.status_code == 422 and "already exists" in response.text.lower():
-        return False, "GitHub 仓库中已存在同名文件。"
+    if response.status_code == 422 and not sha and "already exists" in response.text.lower():
+        return False, "GitHub 仓库中已存在同名文件。", None
 
-    return False, f"HTTP {response.status_code}: {response.text[:300]}"
+    return False, f"HTTP {response.status_code}: {response.text[:300]}", None
+
+
+def upload_file_to_github(
+    filename: str,
+    content: bytes,
+    message: str | None = None,
+) -> tuple[bool, str]:
+    commit_message = message or GITHUB_COMMIT_MESSAGE
+    safe_name = sanitize_filename(filename)
+    _, sha = github_fetch_file(safe_name)
+    ok, err, _ = github_upload_file(safe_name, content, commit_message, sha=sha)
+    return ok, err
+
+
+def get_user_progress_local_path() -> Path:
+    return APP_DIR / USER_PROGRESS_FILE
+
+
+def clamp_batch_index() -> None:
+    total = len(get_question_pool())
+    if total == 0:
+        st.session_state.batch_index = 0
+        return
+    max_batch = (total - 1) // st.session_state.batch_size
+    st.session_state.batch_index = min(st.session_state.batch_index, max_batch)
+
+
+def build_user_progress_payload() -> dict:
+    return {
+        "version": 1,
+        "quiz_type": st.session_state.quiz_type,
+        "batch_index": st.session_state.batch_index,
+        "wrong_book": st.session_state.wrong_book,
+    }
+
+
+def apply_user_progress(data: dict) -> None:
+    quiz_type = data.get("quiz_type")
+    if quiz_type in QUIZ_TYPES:
+        st.session_state.quiz_type = quiz_type
+
+    wrong_book = data.get("wrong_book")
+    if isinstance(wrong_book, dict):
+        st.session_state.wrong_book = wrong_book
+
+    batch_index = data.get("batch_index", 0)
+    if isinstance(batch_index, int) and batch_index >= 0:
+        st.session_state.batch_index = batch_index
+
+    clamp_batch_index()
+
+
+def load_user_progress() -> None:
+    if st.session_state.get("user_progress_loaded"):
+        return
+
+    data = None
+    remote_content, _ = github_fetch_file(USER_PROGRESS_FILE)
+    if remote_content:
+        try:
+            data = json.loads(remote_content.decode("utf-8"))
+            get_user_progress_local_path().write_bytes(remote_content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = None
+
+    if data is None:
+        local_path = get_user_progress_local_path()
+        if local_path.is_file():
+            try:
+                data = json.loads(local_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = None
+
+    if data:
+        apply_user_progress(data)
+
+    st.session_state.user_progress_loaded = True
+
+
+def save_user_progress() -> None:
+    try:
+        payload = build_user_progress_payload()
+        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        get_user_progress_local_path().write_bytes(content)
+        upload_file_to_github(USER_PROGRESS_FILE, content, message=PROGRESS_COMMIT_MESSAGE)
+    except Exception:
+        pass
 
 
 def register_uploaded_bank(filename: str, content: bytes, quiz_type: str, questions: list[dict]) -> str:
@@ -2016,6 +2137,7 @@ def init_session_state():
         "processed_upload_hashes": set(),
         "wrong_book": {},
         "persisted_loaded": False,
+        "user_progress_loaded": False,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -2023,6 +2145,7 @@ def init_session_state():
 
 init_session_state()
 load_persisted_uploads()
+load_user_progress()
 
 
 def reset_progress():
@@ -2251,6 +2374,7 @@ with st.sidebar:
     )
     if selected_batch_size != st.session_state.batch_size:
         apply_batch_size_change(selected_batch_size)
+        save_user_progress()
         st.rerun()
 
     st.markdown("---")
@@ -2265,6 +2389,7 @@ with st.sidebar:
     if selected_type != st.session_state.quiz_type:
         st.session_state.quiz_type = selected_type
         reset_progress()
+        save_user_progress()
         st.rerun()
 
     wrong_count = len(get_wrong_questions_for_type(st.session_state.quiz_type))
@@ -2486,6 +2611,7 @@ if submitted:
     st.session_state.submitted = True
     st.session_state.user_answers = user_answers
     st.session_state.results = results
+    save_user_progress()
 
 # ── 批改反馈 ──
 if st.session_state.submitted and st.session_state.results:
@@ -2527,13 +2653,16 @@ if st.session_state.submitted and st.session_state.results:
             if st.button(f"➡️ 进入下 {batch_size} 道题", use_container_width=True):
                 st.session_state.batch_index += 1
                 clear_batch_state()
+                save_user_progress()
                 st.rerun()
         else:
             if st.button("🎊 全部刷完，查看通关庆祝", use_container_width=True):
                 st.session_state.batch_index += 1
                 clear_batch_state()
+                save_user_progress()
                 st.rerun()
     with col2:
         if st.button("🔄 重新做本组", use_container_width=True):
             clear_batch_state()
+            save_user_progress()
             st.rerun()
