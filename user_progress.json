@@ -1,7 +1,7 @@
 {
   "version": 1,
   "quiz_type": "单选题",
-  "batch_index": 15,
+  "batch_index": 16,
   "wrong_book": {
     "builtin_single_4": {
       "uid": "builtin_single_4",
