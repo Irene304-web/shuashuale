@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from pypdf import PdfReader
 
 APP_DIR = Path(__file__).resolve().parent
@@ -1871,6 +1872,19 @@ def parse_upload_file(data: bytes, filename: str) -> tuple[str, list[dict]] | No
     return None
 
 
+@st.cache_data(show_spinner=False)
+def parse_upload_file_cached(file_hash: str, filename: str, data: bytes) -> tuple[str, list[dict]] | None:
+    return parse_upload_file(data, filename)
+
+
+@st.cache_data(show_spinner=False)
+def load_questions(filepath: str, file_mtime_ns: int) -> tuple[str, list[dict]] | None:
+    path = Path(filepath)
+    content = path.read_bytes()
+    file_hash = hashlib.md5(content).hexdigest()
+    return parse_upload_file_cached(file_hash, path.name, content)
+
+
 def sanitize_filename(filename: str) -> str:
     return Path(filename).name
 
@@ -2080,7 +2094,7 @@ def load_persisted_uploads():
             if file_hash in st.session_state.processed_upload_hashes:
                 continue
 
-            result = parse_upload_file(content, filepath.name)
+            result = load_questions(str(filepath), filepath.stat().st_mtime_ns)
             if not result:
                 continue
 
@@ -2160,6 +2174,71 @@ def clear_batch_state():
     st.session_state.user_answers = {}
     st.session_state.results = None
     st.session_state.form_reset += 1
+
+
+def get_current_question_num() -> int:
+    return st.session_state.batch_index * st.session_state.batch_size + 1
+
+
+def jump_to_question_number(target_num: int) -> None:
+    batch_size = st.session_state.batch_size
+    st.session_state.batch_index = (target_num - 1) // batch_size
+    clamp_batch_index()
+    clear_batch_state()
+
+
+def render_question_jump_form(total_count: int) -> None:
+    if total_count <= 0:
+        return
+
+    current_num = get_current_question_num()
+
+    with st.form("jump_to_question_form", clear_on_submit=False, border=False):
+        col_input, col_btn = st.columns([4, 1])
+        with col_input:
+            target_no = st.number_input(
+                "🧩 输入目标题号：",
+                min_value=1,
+                max_value=total_count,
+                value=current_num,
+                step=1,
+            )
+        with col_btn:
+            submit_button = st.form_submit_button("🚀 秒级直达", use_container_width=True)
+
+    if submit_button:
+        jump_to_question_number(target_no)
+        save_user_progress()
+        st.rerun()
+
+
+def inject_scroll_to_top_overlay() -> None:
+    components.html(
+        """
+        <script>
+        (function () {
+            var doc = window.parent.document;
+            var overlayId = "ss-top-scroll-overlay";
+            var existing = doc.getElementById(overlayId);
+            if (existing) existing.remove();
+
+            var overlay = doc.createElement("div");
+            overlay.id = overlayId;
+            overlay.style.cssText =
+                "position:fixed;top:0;left:0;width:100%;height:40px;" +
+                "z-index:999999;background:transparent;cursor:pointer;";
+            overlay.addEventListener("click", function () {
+                var mainSection = doc.querySelector("section.main");
+                if (mainSection) {
+                    mainSection.scrollTo({top: 0, behavior: "smooth"});
+                }
+            });
+            doc.body.appendChild(overlay);
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def apply_batch_size_change(new_batch_size: int) -> bool:
@@ -2245,7 +2324,7 @@ def process_uploaded_files(uploaded_files):
 
         if local_file_exists(filename):
             skipped.append(filename)
-            result = parse_upload_file(content, filename)
+            result = parse_upload_file_cached(file_hash, filename, content)
             if result:
                 quiz_type, questions = result
                 added.append(register_uploaded_bank(filename, content, quiz_type, questions))
@@ -2253,7 +2332,7 @@ def process_uploaded_files(uploaded_files):
                 errors.append(filename)
             continue
 
-        result = parse_upload_file(content, filename)
+        result = parse_upload_file_cached(file_hash, filename, content)
         if not result:
             errors.append(filename)
             continue
@@ -2348,6 +2427,7 @@ def render_submitted_option_feedback(question: dict, user_ans, quiz_type: str) -
 init_session_state()
 load_persisted_uploads()
 load_user_progress()
+inject_scroll_to_top_overlay()
 
 
 # ──────────────────────────────────────────────
@@ -2526,6 +2606,8 @@ if not questions:
         reset_progress()
         st.rerun()
     st.stop()
+
+render_question_jump_form(total_count)
 
 # ── 答题表单 ──
 is_locked = st.session_state.submitted
